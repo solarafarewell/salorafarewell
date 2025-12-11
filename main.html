@@ -3638,13 +3638,19 @@
 
     function deleteBookedDate(dateStr){
       const cat = _bookingState.category;
-      // local guard: only allow deletion if current user created this booking
-      try{
-        const owners = _loadBookingOwners();
-        const owner = owners && owners[cat] && owners[cat][dateStr] ? owners[cat][dateStr].ownerId : null;
-        const cur = _getCurrentUserId();
-        if (owner && owner !== cur) { return alert('Only the user who reserved this date can remove it.'); }
-      } catch(e){}
+      const cur = _getCurrentUserId();
+      
+      // STRICT GUARD: Check owner before ANY deletion
+      const owners = _loadBookingOwners();
+      const ownerData = owners && owners[cat] && owners[cat][dateStr] ? owners[cat][dateStr] : null;
+      const ownerId = ownerData ? ownerData.ownerId : null;
+      
+      // CRITICAL: If there is owner data and current user is NOT the owner, BLOCK immediately
+      if (ownerData && ownerId && ownerId !== cur) {
+        alert('Only the user who reserved this date (' + ownerData.ownerName + ') can remove it. You do not have permission.');
+        return false;
+      }
+      
       // If Firestore configured, remove there first
       if (window._useFirestore && window._firestoreReady) {
         window._firestoreReady.then(()=> removeDatesFromFirestore(cat, [dateStr])).then(res=>{
@@ -3668,13 +3674,18 @@
     }
 
     function startMoveBooking(dateStr){
-      // ensure only owner can move
-      try{
-        const owners = _loadBookingOwners();
-        const owner = owners && owners[_bookingState.category] && owners[_bookingState.category][dateStr] ? owners[_bookingState.category][dateStr].ownerId : null;
-        const cur = _getCurrentUserId();
-        if (owner && owner !== cur) { return alert('Only the user who reserved this date can move it.'); }
-      } catch(e){}
+      // STRICT GUARD: Check owner before ANY move attempt
+      const cur = _getCurrentUserId();
+      const owners = _loadBookingOwners();
+      const ownerData = owners && owners[_bookingState.category] && owners[_bookingState.category][dateStr] ? owners[_bookingState.category][dateStr] : null;
+      const ownerId = ownerData ? ownerData.ownerId : null;
+      
+      // CRITICAL: If there is owner data and current user is NOT the owner, BLOCK immediately
+      if (ownerData && ownerId && ownerId !== cur) {
+        alert('Only the user who reserved this date (' + ownerData.ownerName + ') can move it. You do not have permission.');
+        return false;
+      }
+      
       // prepare move state: single-day move
       _moveState = { category: _bookingState.category, original: [dateStr], length: 1 };
       const bookedList = document.getElementById('bookedList');
