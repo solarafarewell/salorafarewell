@@ -3094,7 +3094,7 @@
           // ONLY show button if current user is the owner
           const cur = _getCurrentUserId();
           const owner = (catOwners && catOwners[dayStr]) ? catOwners[dayStr].ownerId : null;
-          const isOwner = (!owner || owner === cur);
+          const isOwner = (owner === null || owner === cur);
           
           cell.style.position = cell.style.position || 'relative';
           const mb = document.createElement('button');
@@ -3613,6 +3613,19 @@
           owners[_bookingState.category][d] = { ownerId: ownerId, ownerName: enteredName };
         });
         _saveBookingOwners(owners);
+      } catch(e){}
+      
+      // Also immediately add dates to bookings so they show as reserved
+      try {
+        const bookings = _loadBookings();
+        bookings[_bookingState.category] = bookings[_bookingState.category] || [];
+        datesToBook.forEach(d => {
+          if (!bookings[_bookingState.category].includes(d)) {
+            bookings[_bookingState.category].push(d);
+          }
+        });
+        bookings[_bookingState.category] = Array.from(new Set(bookings[_bookingState.category])).sort();
+        _saveBookings(bookings);
       } catch(e){}
 
       // Open external Google Form in new tab for additional info (per-category URLs)
