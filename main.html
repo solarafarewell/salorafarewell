@@ -2946,32 +2946,50 @@
         // Listen for any change and mirror to localStorage + refresh UI
         col.onSnapshot(snapshot => {
           const obj = {};
+          const owners = {};
           snapshot.forEach(doc => {
             const data = doc.data() || {};
-            obj[doc.id] = Array.isArray(data.dates) ? data.dates.slice().sort() : [];
+            const docId = doc.id;
+            obj[docId] = Array.isArray(data.dates) ? data.dates.slice().sort() : [];
+            // Also extract owner metadata if present
+            owners[docId] = data.owners || {};
           });
           try { localStorage.setItem('room_bookings', JSON.stringify(obj)); } catch(e){}
+          try { localStorage.setItem('room_booking_owners', JSON.stringify(owners)); } catch(e){}
           try { renderBookingCalendar(); } catch(e){}
         }, err => console.error('Bookings listener error', err));
       } catch (e){ console.warn('startFirestoreListeners failed', e); }
     }
 
     function finalizePendingBookingFirestore(pending){
-      // pending: { category, dates: [...] }
+      // pending: { category, dates: [...], ownerId, ownerName }
       if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
       const cat = pending.category;
       const dates = (pending.dates||[]).slice();
+      const ownerId = pending.ownerId;
+      const ownerName = pending.ownerName;
       const ref = window._firestore.collection('bookings').doc(cat);
+      
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
           const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
+          const currentOwners = (doc.exists && doc.data().owners) ? doc.data().owners : {};
+          
           const conflict = dates.find(d => current.indexOf(d) !== -1);
           if (conflict) throw new Error('conflict:' + conflict);
+          
           const merged = Array.from(new Set((current || []).concat(dates))).sort();
-          tx.set(ref, { dates: merged }, { merge: true });
-          return merged;
+          
+          // Add owner metadata for these dates
+          const mergedOwners = { ...currentOwners };
+          dates.forEach(d => {
+            mergedOwners[d] = { ownerId: ownerId, ownerName: ownerName };
+          });
+          
+          tx.set(ref, { dates: merged, owners: mergedOwners }, { merge: true });
+          return { dates: merged, owners: mergedOwners };
         });
-      }).then(merged => ({ok:true, dates: merged})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+      }).then(result => ({ok:true, dates: result.dates, owners: result.owners})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
     // Remove specific dates from a category document in Firestore
@@ -2981,11 +2999,20 @@
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
           const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
+          const currentOwners = (doc.exists && doc.data().owners) ? doc.data().owners : {};
+          
           const remaining = current.filter(d => datesToRemove.indexOf(d) === -1);
-          tx.set(ref, { dates: remaining }, { merge: true });
-          return remaining;
+          
+          // Also remove owner metadata for deleted dates
+          const remainingOwners = { ...currentOwners };
+          datesToRemove.forEach(d => {
+            delete remainingOwners[d];
+          });
+          
+          tx.set(ref, { dates: remaining, owners: remainingOwners }, { merge: true });
+          return { dates: remaining, owners: remainingOwners };
         });
-      }).then(remaining => ({ok:true, dates: remaining})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+      }).then(result => ({ok:true, dates: result.dates, owners: result.owners})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
     // Move (remove originals and add newDates) in a single Firestore transaction
@@ -2995,16 +3022,31 @@
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
           const current = (doc.exists && Array.isArray(doc.data().dates)) ? doc.data().dates : [];
+          const currentOwners = (doc.exists && doc.data().owners) ? doc.data().owners : {};
+          
           const existing = new Set(current);
-          // remove originals temporarily for conflict check
+          // remove originals temporarily for conflict check and owner transfer
           (originals||[]).forEach(d=> existing.delete(d));
           const conflict = (newDates||[]).find(d => existing.has(d));
           if (conflict) throw new Error('conflict:' + conflict);
+          
           const merged = Array.from(new Set(Array.from(existing).concat(newDates))).sort();
-          tx.set(ref, { dates: merged }, { merge: true });
-          return merged;
+          
+          // Transfer owner metadata from original dates to new dates
+          const mergedOwners = { ...currentOwners };
+          for (let i = 0; i < (originals||[]).length; i++) {
+            const orig = originals[i];
+            const target = newDates[i] || newDates[0];
+            if (orig && target && mergedOwners[orig]) {
+              mergedOwners[target] = mergedOwners[orig];
+              delete mergedOwners[orig];
+            }
+          }
+          
+          tx.set(ref, { dates: merged, owners: mergedOwners }, { merge: true });
+          return { dates: merged, owners: mergedOwners };
         });
-      }).then(merged => ({ok:true, dates: merged})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
+      }).then(result => ({ok:true, dates: result.dates, owners: result.owners})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
 
@@ -3653,15 +3695,24 @@
       const cat = _bookingState.category;
       const cur = _getCurrentUserId();
       
-      // STRICT GUARD: Check owner before ANY deletion
+      // STRICT GUARD: Check owner before ANY deletion (checks Firestore first if available)
       const owners = _loadBookingOwners();
       const ownerData = owners && owners[cat] && owners[cat][dateStr] ? owners[cat][dateStr] : null;
       const ownerId = ownerData ? ownerData.ownerId : null;
+      const ownerName = ownerData ? ownerData.ownerName : null;
       
       // CRITICAL: If there is owner data and current user is NOT the owner, BLOCK immediately
-      if (ownerData && ownerId && ownerId !== cur) {
-        alert('Only the user who reserved this date (' + ownerData.ownerName + ') can remove it. You do not have permission.');
-        return false;
+      if (ownerData && ownerId) {
+        // Owner data exists — only allow deletion if current user is the owner
+        if (ownerId !== cur) {
+          alert(`This date is reserved for the ${ownerName} family.\n\nOnly they can remove this booking. You do not have permission.`);
+          return false;
+        }
+      } else {
+        // No owner data found — this might be a booking from before owner tracking was added
+        // For safety, block deletion unless user confirms they own it
+        const confirmDelete = confirm(`No owner information found for this date.\n\nIf you booked this date, click OK to delete it.\n\nOtherwise, click Cancel.`);
+        if (!confirmDelete) return false;
       }
       
       // If Firestore configured, remove there first
@@ -3692,11 +3743,20 @@
       const owners = _loadBookingOwners();
       const ownerData = owners && owners[_bookingState.category] && owners[_bookingState.category][dateStr] ? owners[_bookingState.category][dateStr] : null;
       const ownerId = ownerData ? ownerData.ownerId : null;
+      const ownerName = ownerData ? ownerData.ownerName : null;
       
       // CRITICAL: If there is owner data and current user is NOT the owner, BLOCK immediately
-      if (ownerData && ownerId && ownerId !== cur) {
-        alert('Only the user who reserved this date (' + ownerData.ownerName + ') can move it. You do not have permission.');
-        return false;
+      if (ownerData && ownerId) {
+        // Owner data exists — only allow move if current user is the owner
+        if (ownerId !== cur) {
+          alert(`This date is reserved for the ${ownerName} family.\n\nOnly they can move this booking. You do not have permission.`);
+          return false;
+        }
+      } else {
+        // No owner data found — this might be a booking from before owner tracking was added
+        // For safety, block move unless user confirms they own it
+        const confirmMove = confirm(`No owner information found for this date.\n\nIf you booked this date, click OK to move it.\n\nOtherwise, click Cancel.`);
+        if (!confirmMove) return false;
       }
       
       // prepare move state: single-day move
